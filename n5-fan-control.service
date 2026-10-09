@@ -1,0 +1,27 @@
+[Unit]
+Description=N5 fan controller: SSD and CPU fans from drive and CPU temperatures
+Documentation=https://github.com/outlawpractice/minisforum-n5-fan-control
+After=systemd-modules-load.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+# Optional settings (metrics output); see n5-fan-control.default.
+EnvironmentFile=-/etc/default/n5-fan-control
+ExecStart=/usr/bin/python3 /usr/local/sbin/n5-fan-control
+# Any stop, crash or watchdog kill leaves the controlled fans at full speed.
+ExecStopPost=/usr/bin/python3 /usr/local/sbin/n5-fan-control --failsafe
+Restart=always
+RestartSec=5
+WatchdogSec=20
+# /var/lib/n5-fan-control holds the NVMe drives seen so far; kept across restarts and reboots.
+StateDirectory=n5-fan-control
+ProtectSystem=strict
+# The usual node-exporter textfile directory; add a drop-in for any other.
+ReadWritePaths=-/var/lib/prometheus/node-exporter
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

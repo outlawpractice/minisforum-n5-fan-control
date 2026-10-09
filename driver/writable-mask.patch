@@ -1,0 +1,33 @@
+--- a/minisforum_n5_it5571.c
++++ b/minisforum_n5_it5571.c
+@@ -57,6 +57,12 @@
+ MODULE_PARM_DESC(experimental_write,
+ 		 "Enable PWM writes on experimental or force-loaded systems");
+ 
++/* Local N5 Air change: limit writes to the fan channels a controller owns. */
++static uint writable_mask;
++module_param(writable_mask, uint, 0444);
++MODULE_PARM_DESC(writable_mask,
++		 "Bitmask of PWM channels that may be written (bit 0 = pwm1); default none");
++
+ struct n5_board_profile {
+ 	const char *name;
+ 	bool validated;
+@@ -299,7 +305,7 @@
+ 		}
+ 	case hwmon_pwm:
+ 		/* Experimental systems start in read-only sensor mode. */
+-		if (!data->write_enabled)
++		if (!data->write_enabled || !(writable_mask & BIT(channel)))
+ 			return 0;
+ 		switch (attr) {
+ 		case hwmon_pwm_input:
+@@ -392,7 +398,7 @@
+ 
+ 	if (type != hwmon_pwm || channel >= N5_PWM_CHANNELS)
+ 		return -EOPNOTSUPP;
+-	if (!data->write_enabled)
++	if (!data->write_enabled || !(writable_mask & BIT(channel)))
+ 		return -EPERM;
+ 
+ 	mutex_lock(&data->lock);

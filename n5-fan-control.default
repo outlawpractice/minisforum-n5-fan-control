@@ -1,0 +1,8 @@
+# /etc/default/n5-fan-control: optional settings for n5-fan-control.service.
+# Restart the service after changing this file.
+
+# Write fan duty, SSD fan rpm and control temperatures as a Prometheus textfile
+# (n5_fan.prom) into this directory, for node_exporter's textfile collector or
+# Grafana Alloy. Empty or unset: no metrics. A directory other than
+# /var/lib/prometheus/node-exporter also needs a ReadWritePaths= drop-in.
+N5_FAN_PROM_DIR=
