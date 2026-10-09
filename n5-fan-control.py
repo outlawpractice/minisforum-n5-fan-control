@@ -3,7 +3,8 @@
 
 The firmware's fan curves suit a hard-drive NAS: under sustained NVMe reads the SSD
 fan stayed near 2,200 rpm while a Samsung 990 PRO in a motherboard M.2 slot reached
-80 C. This service sets the SSD fan from the hottest NVMe drive and the CPU fan from
+80 C. This service sets the SSD fan from the hottest internal NVMe drive (drives in
+USB4 enclosures are ignored) and the CPU fan from
 the CPU temperature, through the community minisforum_n5_it5571 driver with the
 writable_mask patch in driver/ (write access only to the channels named below).
 See README.md for measurements, installation and configuration.
@@ -27,7 +28,7 @@ import time
 SYSFS = os.environ.get("N5_FAN_SYSFS", "/sys")
 # Prometheus textfile output, off unless set (for example in /etc/default/n5-fan-control).
 PROM_DIR = os.environ.get("N5_FAN_PROM_DIR", "")
-# NVMe drives seen so far. Kept in the unit's StateDirectory, so it survives service
+# Internal NVMe drives seen so far. Kept in the unit's StateDirectory, so it survives service
 # restarts and reboots: a drive that drops out, or fails to appear at boot, means full
 # speed. After removing a drive on purpose, delete this file and restart the service.
 SEEN_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "/var/lib/n5-fan-control"), "nvme-drives")
@@ -76,16 +77,38 @@ def find_hwmon(name):
     return None
 
 
+def usb4_attached(nvme_dir):
+    """True if the controller's PCIe path passes a port tunnelled through USB4/Thunderbolt.
+
+    The kernel links each USB4 PCIe tunnel port to its USB4 host interface as a device-link
+    supplier ("supplier:pci:..." in the port's directory), and the thunderbolt driver binds
+    that host interface. Without such a link the drive counts as internal, so a detection
+    that misses keeps the fail-safe rather than dropping it.
+    """
+    top = os.path.realpath(os.path.join(SYSFS, "devices"))
+    dev = os.path.realpath(os.path.join(nvme_dir, "device"))
+    while dev.startswith(top + os.sep):
+        for link in glob.glob(os.path.join(dev, "supplier:*")):
+            if os.path.basename(os.path.realpath(os.path.join(link, "supplier/driver"))) == "thunderbolt":
+                return True
+        dev = os.path.dirname(dev)
+    return False
+
+
 def nvme_temps():
-    """Composite temperature of every NVMe drive, in C. Raises if none can be read."""
+    """Composite temperature of every internal NVMe drive, in C. Drives attached through
+    USB4 are left out, so they are neither recorded nor used for the SSD fan (they sit
+    outside the case and come and go). Raises if no internal temperature can be read."""
     temps = {}
     for d in sorted(glob.glob(os.path.join(SYSFS, "class/nvme/nvme*"))):
+        if usb4_attached(d):
+            continue
         hw = sorted(glob.glob(os.path.join(d, "hwmon*")) + glob.glob(os.path.join(d, "device/hwmon/hwmon*")))
         if not hw:
             raise RuntimeError(f"{os.path.basename(d)} has no temperature sensor")
         temps[os.path.basename(d)] = read_int(os.path.join(hw[0], "temp1_input")) / 1000
     if not temps:
-        raise RuntimeError("no NVMe temperatures found")
+        raise RuntimeError("no internal NVMe temperatures found")
     return temps
 
 
@@ -245,7 +268,7 @@ def tick(fans):
         temps = nvme_temps()
         missing = fans.seen - set(temps)
         if missing:
-            raise RuntimeError(f"{', '.join(sorted(missing))} recorded but no longer present")
+            raise RuntimeError(f"{', '.join(sorted(missing))} recorded but no longer present as an internal drive")
         if set(temps) - fans.seen:
             candidate = fans.seen | set(temps)
             write_seen(candidate)            # record first; memory follows only on success

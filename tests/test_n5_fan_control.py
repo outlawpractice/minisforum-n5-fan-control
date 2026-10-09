@@ -48,6 +48,42 @@ def make_sysfs(nvme=(40, 42), cpu=45):
     return root, ec
 
 
+def add_nvme(root, name, temp, port, supplier_driver=None, sensor=True):
+    """A controller laid out as in real sysfs, below PCI root port `port`. With supplier_driver,
+    the port gets a device-link supplier bound to that driver: the kernel links each USB4 PCIe
+    tunnel port to its USB4 host interface, which the "thunderbolt" driver binds.
+    Returns the PCI device directory; removing it and the class link is an unplug."""
+    devices = root / "devices/pci0000:00"
+    pci = devices / port / "0000:72:00.0" / f"pci-{name}"
+    ctl = pci / "nvme" / name
+    ctl.mkdir(parents=True)
+    (ctl / "device").symlink_to("../..")
+    if sensor:
+        (ctl / "hwmon20").mkdir()
+        (ctl / "hwmon20/temp1_input").write_text(f"{temp * 1000}\n")
+    (root / "class/nvme").mkdir(parents=True, exist_ok=True)
+    (root / "class/nvme" / name).symlink_to(ctl)
+    if supplier_driver:
+        supplier = "0000:d4:00.6" if supplier_driver == "thunderbolt" else "0000:d4:00.3"
+        nhi = devices / "0000:00:08.3" / supplier
+        nhi.mkdir(parents=True, exist_ok=True)
+        driver = root / "bus/pci/drivers" / supplier_driver
+        driver.mkdir(parents=True, exist_ok=True)
+        if not (nhi / "driver").is_symlink():
+            (nhi / "driver").symlink_to(driver)
+        link = root / f"devices/virtual/devlink/pci:{supplier}--pci:{port}"
+        if not link.exists():
+            link.mkdir(parents=True)
+            (link / "supplier").symlink_to(nhi)
+            (devices / port / f"supplier:pci:{supplier}").symlink_to(link)
+    return pci
+
+
+def unplug(root, name, pci):
+    (root / "class/nvme" / name).unlink()
+    shutil.rmtree(pci)
+
+
 def pwm(ec, ch):
     return int((ec / f"pwm{ch}").read_text())
 
@@ -166,6 +202,67 @@ def test_drive_appearing_later_is_added():
     fanctl.tick(fans)
     assert pwm(ec, 2) < 255, "a new drive is not a fault"
     assert Path(fanctl.SEEN_FILE).read_text() == "nvme0\nnvme1\n"
+
+
+def test_usb4_drive_appearing_and_disappearing_keeps_the_curve():
+    root, ec = make_sysfs(nvme=(40, 42))
+    fans = fanctl.Fans()
+    fanctl.tick(fans)
+    curve_42 = fanctl.to_pwm(fanctl.curve(fanctl.FANS["ssd"]["points"], 42))
+    pci = add_nvme(root, "nvme5", 41, "0000:00:04.1", "thunderbolt", sensor=False)
+    fanctl.tick(fans)
+    assert pwm(ec, 2) == curve_42, "a USB4 drive still enumerating (no sensor yet) is not a fault"
+    (pci / "nvme/nvme5/hwmon20").mkdir()
+    (pci / "nvme/nvme5/hwmon20/temp1_input").write_text("41000\n")
+    fanctl.tick(fans)
+    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0\nnvme1\n", "a USB4 drive is not recorded"
+    unplug(root, "nvme5", pci)
+    pci = add_nvme(root, "nvme6", 41, "0000:00:04.1", "thunderbolt")    # replugged under a new name
+    fanctl.tick(fans)
+    unplug(root, "nvme6", pci)
+    for _ in range(3):
+        fanctl.tick(fans)
+    assert pwm(ec, 2) == curve_42 and pwm(ec, 1) != 255, "unplugging a USB4 drive is not a fault"
+    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0\nnvme1\n"
+
+
+def test_internal_drive_disappearing_beside_a_usb4_drive_means_full_speed():
+    root, ec = make_sysfs(nvme=(40,))
+    internal = add_nvme(root, "nvme1", 42, "0000:00:01.4", "xhci_hcd")   # a supplier, but not a USB4 host
+    add_nvme(root, "nvme2", 41, "0000:00:04.1", "thunderbolt")
+    fans = fanctl.Fans()
+    fanctl.tick(fans)
+    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0\nnvme1\n"
+    assert pwm(ec, 2) < 255
+    unplug(root, "nvme1", internal)
+    fanctl.tick(fans)
+    assert pwm(ec, 1) == 255 and pwm(ec, 2) == 255 and pwm(ec, 4) == 255, "a recorded internal drive must not drop out"
+
+
+def test_usb4_drive_temperature_does_not_drive_the_ssd_fan():
+    for usb4_temp in (66, 150):                                        # hot, and implausible
+        root, ec = make_sysfs(nvme=(40, 48))
+        add_nvme(root, "nvme2", usb4_temp, "0000:00:04.1", "thunderbolt")
+        fans = fanctl.Fans()
+        fanctl.tick(fans)
+        assert pwm(ec, 2) == fanctl.to_pwm(fanctl.curve(fanctl.FANS["ssd"]["points"], 48)), usb4_temp
+        assert 'source="nvme_max"} 48.0' in (root / "prom/n5_fan.prom").read_text()
+
+
+def test_recorded_internal_name_now_on_usb4_means_full_speed():
+    root, ec = make_sysfs(nvme=(40, 42))
+    Path(fanctl.SEEN_FILE).write_text("nvme0\nnvme1\nnvme2\n")
+    add_nvme(root, "nvme2", 41, "0000:00:04.1", "thunderbolt")          # the internal nvme2 is gone; a USB4 drive took its name
+    fans = fanctl.Fans()
+    fanctl.tick(fans)
+    assert pwm(ec, 2) == 255, "a USB4 drive must not stand in for a recorded internal one"
+
+
+def test_only_usb4_drives_means_full_speed():
+    root, ec = make_sysfs(nvme=())
+    add_nvme(root, "nvme0", 41, "0000:00:04.1", "thunderbolt")
+    fanctl.tick(fanctl.Fans())
+    assert pwm(ec, 2) == 255, "no internal temperature to follow"
 
 
 def test_metrics_off_unless_configured():

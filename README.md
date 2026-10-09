@@ -34,7 +34,7 @@ The CPU fan has no speed sensor, and a listening test could not tell whether `pw
 
 | Fan | Input | Curve (°C to duty) |
 | --- | --- | --- |
-| SSD | hottest NVMe drive (composite temperature) | 45 to 35%, 55 to 60%, 65 to 85%, 70 to 100% |
+| SSD | hottest internal NVMe drive (composite temperature) | 45 to 35%, 55 to 60%, 65 to 85%, 70 to 100% |
 | CPU | `k10temp` Tctl | off below 55°C; 55 to 25%, 70 to 55%, 80 to 80%, 88 to 100%; off again at 50°C or below |
 
 - Linear between points and clamped at the ends, updated every 2 seconds.
@@ -49,7 +49,7 @@ To change a curve, edit `FANS` in `n5-fan-control.py` and run the installer agai
 All three controlled channels go to full speed when:
 
 - a temperature is missing, unreadable, or outside 5 to 120°C;
-- an NVMe drive has no temperature sensor, or a drive the service has seen before is missing, including one that fails to appear after a reboot (the list is kept in `/var/lib/n5-fan-control/nvme-drives`), or that list cannot be written;
+- an internal NVMe drive has no temperature sensor, or an internal drive the service has seen before is missing, including one that fails to appear after a reboot (the list is kept in `/var/lib/n5-fan-control/nvme-drives`), or that list cannot be written;
 - the service stops, crashes, or stops responding for 20 seconds (systemd watchdog; `ExecStopPost` runs `n5-fan-control --failsafe`).
 
 The service also refuses to start unless its three channels are writable. After a sensor problem clears, speeds fall from full at the normal 4% per update. Optional parts do not affect fan control: an unreadable SSD fan speed is left out of the metrics, and a failed metrics write is logged.
@@ -60,6 +60,21 @@ After removing an NVMe drive on purpose, clear the list, or the fans stay at ful
 sudo rm /var/lib/n5-fan-control/nvme-drives
 sudo systemctl restart n5-fan-control
 ```
+
+### NVMe drives in USB4 enclosures
+
+An NVMe drive in a USB4 or Thunderbolt enclosure appears as an ordinary NVMe controller, tunnelled over PCIe through the USB4 host router. The service ignores these drives: it does not record them, and their temperatures do not set the SSD fan, because they sit outside the case and are plugged and unplugged at will (a replug can also give the drive a new name, such as `nvme5` becoming `nvme6`). Internal drives keep the full fail-safe.
+
+A drive counts as USB4-attached when a PCIe port on its path has a device-link supplier bound to the `thunderbolt` driver. The kernel creates that link from each USB4 PCIe tunnel port to its USB4 host interface. To check how the service will see your drives, look for `supplier:` links on the ports above each controller:
+
+```bash
+readlink -f /sys/class/nvme/nvme*/device
+ls -d /sys/bus/pci/devices/*/supplier:*
+```
+
+Any drive without such a link counts as internal, so a missed detection keeps the fail-safe. If a recorded name now belongs to a USB4 drive (an internal drive dropped out and the enclosure took its name), the fans go to full speed.
+
+If a version without this check recorded a USB4 drive in the list, remove that name from the list and restart the service.
 
 On this board, setting a channel back to automatic (`pwm_enable=2`) returns the SSD fan to the firmware but does **not** release the CPU fan channels. Once Linux has set them, they stay where Linux left them until a reboot. That is why every exit path leaves them at full speed.
 
