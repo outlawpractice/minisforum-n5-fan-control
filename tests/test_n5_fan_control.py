@@ -23,7 +23,9 @@ DEFAULT_PROM_DIR = fanctl.PROM_DIR   # before make_sysfs overrides it
 DEFAULT_SEEN_FILE = fanctl.SEEN_FILE
 
 
-def make_sysfs(nvme=(40, 42), cpu=45):
+def make_sysfs(nvme=(40, 42), cpu=45, warning=None):
+    """Each nvme entry is a composite temperature, or a tuple of the composite and its sensors.
+    warning: one temp1_max for every drive, a tuple of them per drive, or None for none."""
     root = Path(tempfile.mkdtemp())
     k10 = root / "class/hwmon/hwmon0"
     k10.mkdir(parents=True)
@@ -39,7 +41,11 @@ def make_sysfs(nvme=(40, 42), cpu=45):
     for i, t in enumerate(nvme):
         hw = root / f"class/nvme/nvme{i}/hwmon{10 + i}"
         hw.mkdir(parents=True)
-        (hw / "temp1_input").write_text(f"{t * 1000}\n")
+        for k, temp in enumerate(t if isinstance(t, tuple) else (t,), 1):
+            (hw / f"temp{k}_input").write_text(f"{round(temp * 1000)}\n")
+        w = warning[i] if isinstance(warning, tuple) else warning
+        if w is not None:
+            (hw / "temp1_max").write_text(f"{round(w * 1000)}\n")
     prom = root / "prom"
     prom.mkdir()
     fanctl.SEEN_FILE = str(root / "nvme-drives")
@@ -88,13 +94,24 @@ def pwm(ec, ch):
     return int((ec / f"pwm{ch}").read_text())
 
 
+def ssd_pwm(margin):
+    """The SSD fan's pwm value for a margin to the warning temperature, with no trend."""
+    return fanctl.to_pwm(fanctl.curve(fanctl.FANS["ssd"]["points"], margin))
+
+
+def set_temp(root, drive, sensor, temp):
+    hw = next((root / "class/nvme" / drive).glob("hwmon*"))
+    (hw / f"{sensor}_input").write_text(f"{round(temp * 1000)}\n")
+
+
 def test_curve_clamps_and_interpolates():
     pts = fanctl.FANS["ssd"]["points"]
-    assert fanctl.curve(pts, 20) == 35
-    assert fanctl.curve(pts, 45) == 35
-    assert fanctl.curve(pts, 50) == 48
-    assert fanctl.curve(pts, 65) == 85
-    assert fanctl.curve(pts, 90) == 100
+    assert fanctl.curve(pts, 40) == 35
+    assert fanctl.curve(pts, 30) == 35
+    assert fanctl.curve(pts, 25) == 48
+    assert fanctl.curve(pts, 12) == 85
+    assert fanctl.curve(pts, 7) == 100
+    assert fanctl.curve(pts, -5) == 100
 
 
 def test_speed_rises_at_once_and_falls_slowly():
@@ -104,13 +121,204 @@ def test_speed_rises_at_once_and_falls_slowly():
     assert fanctl.next_duty(42, 40) == 40
 
 
+def test_steady_temperatures_follow_the_margin_curve():
+    _, ec = make_sysfs(nvme=((50, 56, 52), (45, 47, 46)), warning=(82, 85))
+    fans = fanctl.Fans()
+    for i in range(8):
+        assert fanctl.tick(fans, now=2.0 * i)["ssd"] == fanctl.curve(fanctl.FANS["ssd"]["points"], 82 - 56), i
+        assert pwm(ec, 2) == ssd_pwm(82 - 56), i
+
+
+def test_rising_trend_raises_the_duty_before_the_reading_does():
+    root, ec = make_sysfs(nvme=((50, 52, 51),), warning=82)
+    fans = fanctl.Fans()
+    for i in range(fanctl.TREND_READINGS):
+        set_temp(root, "nvme0", "temp2", 52 + i)                      # 0.5 C/s
+        fanctl.tick(fans, now=2.0 * i)
+        if i < fanctl.TREND_READINGS - 1:
+            assert pwm(ec, 2) == ssd_pwm(82 - (52 + i)), "no trend before TREND_READINGS readings"
+    latest = 52 + fanctl.TREND_READINGS - 1
+    ahead = latest + 0.5 * fanctl.PREDICT_AHEAD
+    assert pwm(ec, 2) == ssd_pwm(82 - ahead), "a steady rise is planned for PREDICT_AHEAD seconds ahead"
+    assert pwm(ec, 2) > ssd_pwm(82 - latest)
+    prom = (root / "prom/n5_fan.prom").read_text()
+    assert f'n5_fan_nvme_hottest_celsius{{drive="nvme0"}} {float(latest)}' in prom
+    assert f'n5_fan_nvme_predicted_celsius{{drive="nvme0"}} {ahead}' in prom
+    assert f'n5_fan_nvme_margin_celsius{{drive="nvme0"}} {82 - ahead}' in prom
+    assert f"n5_fan_ssd_margin_celsius {82 - ahead}" in prom
+
+
+def test_noisy_readings_do_not_count_as_a_trend():
+    # Sensor 1 of the 990 EVOs on N5 jumps up to 5 C between readings at idle.
+    root, ec = make_sysfs(nvme=((41, 45, 41),), warning=75)
+    fans = fanctl.Fans()
+    for i, t in enumerate((45, 48, 45, 48, 48)):
+        set_temp(root, "nvme0", "temp2", t)
+        fanctl.tick(fans, now=2.0 * i)
+    assert pwm(ec, 2) == ssd_pwm(75 - 48)
+
+
+def test_falling_trend_never_lowers_the_duty_faster_than_max_step_down():
+    points = fanctl.FANS["ssd"]["points"]
+    root, _ = make_sysfs(nvme=((60, 74),), warning=82)
+    fans = fanctl.Fans()
+    for i in range(12):                                                # fast fall, 1 C/s from margin 8
+        before = fans.duty["ssd"]
+        set_temp(root, "nvme0", "temp2", 74 - 2 * i)
+        fanctl.tick(fans, now=2.0 * i)
+        if before is not None:
+            assert 0 <= before - fans.duty["ssd"] <= fanctl.MAX_STEP_DOWN, i
+        assert fans.duty["ssd"] >= fanctl.curve(points, 82 - (74 - 2 * i)), i
+    root, _ = make_sysfs(nvme=((50, 58),), warning=82)
+    fans = fanctl.Fans()
+    for i in range(12):                                                # slow fall, 0.25 C/s from margin 24
+        set_temp(root, "nvme0", "temp2", 58 - 0.5 * i)
+        fanctl.tick(fans, now=2.0 * i)
+        assert fans.duty["ssd"] == fanctl.curve(points, 82 - (58 - 0.5 * i)), "a fall is never predicted ahead"
+
+
+def test_hottest_sensor_not_the_composite_sets_the_duty():
+    root, ec = make_sysfs(nvme=((55, 66, 58), (60,)), warning=82)
+    fanctl.tick(fanctl.Fans(), now=0)
+    assert pwm(ec, 2) == ssd_pwm(82 - 66)
+    prom = (root / "prom/n5_fan.prom").read_text()
+    assert 'n5_fan_nvme_hottest_celsius{drive="nvme0"} 66.0' in prom
+    assert 'n5_fan_control_temp_celsius{source="nvme_max"} 60.0' in prom, "nvme_max stays the hottest composite"
+
+
+def test_each_drive_is_measured_against_its_own_warning_temperature():
+    _, ec = make_sysfs(nvme=((60, 64), (55, 58)), warning=(85, 70))   # nvme0 hotter, nvme1 nearer its limit
+    fanctl.tick(fanctl.Fans(), now=0)
+    assert pwm(ec, 2) == ssd_pwm(70 - 58)
+    root, ec = make_sysfs(nvme=((60, 64),), warning=85)
+    (root / "class/nvme/nvme0/hwmon10/temp1_crit").write_text("80000\n")
+    fanctl.tick(fanctl.Fans(), now=0)
+    assert pwm(ec, 2) == ssd_pwm(80 - 64), "temp1_crit caps the warning temperature"
+    root, ec = make_sysfs(nvme=((50, 52),))
+    fanctl.tick(fanctl.Fans(), now=0)
+    assert pwm(ec, 2) == ssd_pwm(fanctl.DEFAULT_WARNING - 52), "no temp1_max: DEFAULT_WARNING"
+    assert 'n5_fan_nvme_warning_celsius{drive="nvme0"} 70' in (root / "prom/n5_fan.prom").read_text()
+
+
+def test_sensor_and_warning_problems_mean_full_speed():
+    def break_temp2_hot(hw): (hw / "temp2_input").write_text("150000\n")
+    def break_temp2_zero_kelvin(hw): (hw / "temp2_input").write_text("-273150\n")
+    def break_warning_zero(hw): (hw / "temp1_max").write_text("0\n")
+    def break_warning_unset(hw): (hw / "temp1_max").write_text("65261850\n")
+    def break_warning_unreadable(hw):
+        (hw / "temp1_max").unlink()
+        (hw / "temp1_max").mkdir()
+    def break_temp2_gone(hw): (hw / "temp2_input").unlink()
+    def break_max_gone(hw): (hw / "temp1_max").unlink()               # would fall back to DEFAULT_WARNING
+    def break_crit_gone(hw): (hw / "temp1_crit").unlink()             # would drop the cap
+    def break_crit_zero(hw): (hw / "temp1_crit").write_text("0\n")
+    for breaker in (break_temp2_hot, break_temp2_zero_kelvin, break_warning_zero, break_warning_unset,
+                    break_warning_unreadable, break_temp2_gone, break_max_gone, break_crit_gone, break_crit_zero):
+        root, ec = make_sysfs(nvme=((50, 55, 52), (45,)), warning=82)
+        (root / "class/nvme/nvme0/hwmon10/temp1_crit").write_text("85000\n")
+        fans = fanctl.Fans()
+        fanctl.tick(fans, now=0)
+        assert pwm(ec, 2) < 255
+        breaker(root / "class/nvme/nvme0/hwmon10")
+        for i in range(1, 4):
+            fanctl.tick(fans, now=2.0 * i)
+            assert pwm(ec, 1) == 255 and pwm(ec, 2) == 255 and pwm(ec, 4) == 255, (breaker.__name__, i)
+    root, ec = make_sysfs(nvme=((50, 55, 52),), warning=82)
+    break_warning_unreadable(root / "class/nvme/nvme0/hwmon10")         # unreadable from the first read
+    fanctl.tick(fanctl.Fans(), now=0)
+    assert pwm(ec, 2) == 255, "an unreadable temp1_max is not a missing one"
+
+
+def test_files_seen_in_a_failed_tick_are_still_remembered():
+    def fail_nvme1(root, hw0): (root / "class/nvme/nvme1/hwmon11/temp1_input").write_text("bad\n")
+    def heal_nvme1(root, hw0): (root / "class/nvme/nvme1/hwmon11/temp1_input").write_text("45000\n")
+    def fail_crit(root, hw0):
+        (hw0 / "temp1_crit").unlink()
+        (hw0 / "temp1_crit").mkdir()
+    def heal_crit(root, hw0):
+        (hw0 / "temp1_crit").rmdir()
+        (hw0 / "temp1_crit").write_text("85000\n")
+    for fail, heal, vanish in ((fail_nvme1, heal_nvme1, "temp1_max"), (fail_nvme1, heal_nvme1, "temp1_crit"),
+                               (fail_crit, heal_crit, "temp1_max"), (fail_nvme1, heal_nvme1, "drive")):
+        root, ec = make_sysfs(nvme=((50, 55, 52), (45,)), warning=(60, 82))
+        hw0 = root / "class/nvme/nvme0/hwmon10"
+        (hw0 / "temp1_crit").write_text("85000\n")
+        fans = fanctl.Fans()
+        fail(root, hw0)
+        assert fanctl.tick(fans, now=0) is None, "the first tick fails part way"
+        heal(root, hw0)
+        if vanish == "drive":
+            shutil.rmtree(root / "class/nvme/nvme0")
+        else:
+            (hw0 / vanish).unlink()
+        for i in range(1, 4):
+            fanctl.tick(fans, now=2.0 * i)
+            assert pwm(ec, 1) == 255 and pwm(ec, 2) == 255 and pwm(ec, 4) == 255, (fail.__name__, vanish, i)
+
+
+def test_files_listed_beside_a_missing_input_are_still_recorded():
+    def hide(path): path.rename(path.parent.parent / f"{path.name}.away")     # outside every glob
+    def unhide(path): (path.parent.parent / f"{path.name}.away").rename(path)
+    for case in ("old record, drive missing", "new limit, sensor missing", "new limit, drive missing"):
+        root, ec = make_sysfs(nvme=((50, 55, 52), (45,)), warning=(None, 82))
+        hw0 = root / "class/nvme/nvme0/hwmon10"
+        nvme1 = root / "class/nvme/nvme1"
+        if case.startswith("old record"):
+            (hw0 / "temp1_max").write_text("60000\n")
+            Path(fanctl.SEEN_FILE).write_text("nvme0\nnvme1\n")         # as installed on N5 today
+            hidden = nvme1
+        else:
+            fanctl.tick(fanctl.Fans(), now=0)                            # record without nvme0 temp1_max
+            (hw0 / "temp1_max").write_text("60000\n")                    # appears while something is missing
+            hidden = hw0 / "temp3_input" if "sensor" in case else nvme1
+        hide(hidden)
+        fans = fanctl.Fans()
+        assert fanctl.tick(fans, now=2) is None, case
+        unhide(hidden)
+        (hw0 / "temp1_max").unlink()
+        for i in range(2, 5):
+            fanctl.tick(fans, now=2.0 * i)
+            assert pwm(ec, 1) == 255 and pwm(ec, 2) == 255 and pwm(ec, 4) == 255, (case, i)
+
+
+def test_recorded_files_survive_a_restart_and_old_records_upgrade():
+    root, ec = make_sysfs(nvme=((50, 55, 52), (45,)), warning=82)
+    hw0 = root / "class/nvme/nvme0/hwmon10"
+    fanctl.tick(fanctl.Fans(), now=0)
+    assert Path(fanctl.SEEN_FILE).read_text() == \
+        "nvme0 temp1_input temp1_max temp2_input temp3_input\nnvme1 temp1_input temp1_max\n"
+    for vanish in ("temp1_max", "temp3_input"):
+        (hw0 / vanish).rename(hw0 / f"{vanish}.away")
+        fans = fanctl.Fans()                                           # a service restart or a reboot
+        fans.take_over()
+        fanctl.tick(fans, now=2)
+        assert pwm(ec, 2) == 255, f"{vanish} recorded before the restart and missing now"
+        (hw0 / f"{vanish}.away").rename(hw0 / vanish)
+    Path(fanctl.SEEN_FILE).write_text("nvme0\nnvme1\n")                 # written by a version before file lists
+    fanctl.tick(fanctl.Fans(), now=4)
+    assert pwm(ec, 2) == ssd_pwm(82 - 55), "an old record is not a fault"
+    assert Path(fanctl.SEEN_FILE).read_text() == \
+        "nvme0 temp1_input temp1_max temp2_input temp3_input\nnvme1 temp1_input temp1_max\n"
+
+
+def test_trend_does_not_span_a_fault():
+    root, _ = make_sysfs(nvme=((50, 52),), warning=82)
+    fans = fanctl.Fans()
+    for i in range(4):
+        fanctl.tick(fans, now=2.0 * i)
+    set_temp(root, "nvme0", "temp2", 150)
+    assert fanctl.tick(fans, now=8) is None
+    set_temp(root, "nvme0", "temp2", 62)
+    assert fanctl.tick(fans, now=10)["ssd"] == fanctl.curve(fanctl.FANS["ssd"]["points"], 82 - 62)
+
+
 def test_tick_sets_both_fans_from_temperatures():
-    _, ec = make_sysfs(nvme=(48, 66), cpu=75)
+    _, ec = make_sysfs(nvme=(48, 66), cpu=75, warning=82)
     fans = fanctl.Fans()
     fans.take_over()
     assert all((ec / f"pwm{ch}_enable").read_text() == "1" for ch in (1, 2, 4))
     fanctl.tick(fans)
-    assert pwm(ec, 2) == fanctl.to_pwm(fanctl.curve(fanctl.FANS["ssd"]["points"], 66)), "SSD fan follows the hottest NVMe"
+    assert pwm(ec, 2) == ssd_pwm(82 - 66), "SSD fan follows the hottest NVMe"
     cpu = fanctl.to_pwm(fanctl.curve(fanctl.FANS["cpu"]["points"], 75))
     assert pwm(ec, 1) == cpu and pwm(ec, 4) == cpu, "both CPU fan channels follow Tctl"
 
@@ -174,10 +382,10 @@ def test_failed_seen_write_is_retried_and_stays_full():
     for _ in range(3):
         fanctl.tick(fans)
         assert pwm(ec, 2) == 255, "unrecorded drives: full speed until the record is written"
-    assert fans.seen == set(), "memory must not run ahead of the file"
+    assert fans.seen == {}, "memory must not run ahead of the file"
     (root / "state").mkdir()
     fanctl.tick(fans)
-    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0\nnvme1\n"
+    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0 temp1_input\nnvme1 temp1_input\n"
     assert pwm(ec, 2) < 255
 
 
@@ -201,21 +409,21 @@ def test_drive_appearing_later_is_added():
     (hw / "temp1_input").write_text("41000\n")
     fanctl.tick(fans)
     assert pwm(ec, 2) < 255, "a new drive is not a fault"
-    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0\nnvme1\n"
+    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0 temp1_input\nnvme1 temp1_input\n"
 
 
 def test_usb4_drive_appearing_and_disappearing_keeps_the_curve():
     root, ec = make_sysfs(nvme=(40, 42))
     fans = fanctl.Fans()
     fanctl.tick(fans)
-    curve_42 = fanctl.to_pwm(fanctl.curve(fanctl.FANS["ssd"]["points"], 42))
+    curve_42 = ssd_pwm(fanctl.DEFAULT_WARNING - 42)
     pci = add_nvme(root, "nvme5", 41, "0000:00:04.1", "thunderbolt", sensor=False)
     fanctl.tick(fans)
     assert pwm(ec, 2) == curve_42, "a USB4 drive still enumerating (no sensor yet) is not a fault"
     (pci / "nvme/nvme5/hwmon20").mkdir()
     (pci / "nvme/nvme5/hwmon20/temp1_input").write_text("41000\n")
     fanctl.tick(fans)
-    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0\nnvme1\n", "a USB4 drive is not recorded"
+    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0 temp1_input\nnvme1 temp1_input\n", "a USB4 drive is not recorded"
     unplug(root, "nvme5", pci)
     pci = add_nvme(root, "nvme6", 41, "0000:00:04.1", "thunderbolt")    # replugged under a new name
     fanctl.tick(fans)
@@ -223,7 +431,7 @@ def test_usb4_drive_appearing_and_disappearing_keeps_the_curve():
     for _ in range(3):
         fanctl.tick(fans)
     assert pwm(ec, 2) == curve_42 and pwm(ec, 1) != 255, "unplugging a USB4 drive is not a fault"
-    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0\nnvme1\n"
+    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0 temp1_input\nnvme1 temp1_input\n"
 
 
 def test_internal_drive_disappearing_beside_a_usb4_drive_means_full_speed():
@@ -232,7 +440,7 @@ def test_internal_drive_disappearing_beside_a_usb4_drive_means_full_speed():
     add_nvme(root, "nvme2", 41, "0000:00:04.1", "thunderbolt")
     fans = fanctl.Fans()
     fanctl.tick(fans)
-    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0\nnvme1\n"
+    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0 temp1_input\nnvme1 temp1_input\n"
     assert pwm(ec, 2) < 255
     unplug(root, "nvme1", internal)
     fanctl.tick(fans)
@@ -245,7 +453,7 @@ def test_usb4_drive_temperature_does_not_drive_the_ssd_fan():
         add_nvme(root, "nvme2", usb4_temp, "0000:00:04.1", "thunderbolt")
         fans = fanctl.Fans()
         fanctl.tick(fans)
-        assert pwm(ec, 2) == fanctl.to_pwm(fanctl.curve(fanctl.FANS["ssd"]["points"], 48)), usb4_temp
+        assert pwm(ec, 2) == ssd_pwm(fanctl.DEFAULT_WARNING - 48), usb4_temp
         assert 'source="nvme_max"} 48.0' in (root / "prom/n5_fan.prom").read_text()
 
 
