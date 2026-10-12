@@ -11,7 +11,8 @@ the writable_mask patch in driver/ (write access only to the channels named belo
 See README.md for measurements, installation and configuration.
 
 Fail-safe: a missing or implausible temperature or warning temperature, a drive or
-sensor that drops out, a failed write, a stop or a crash all leave the controlled
+sensor that drops out (for REMAP_AFTER seconds, after which the drives present are
+recorded instead), a failed write, a stop or a crash all leave the controlled
 fans at full speed. The CPU fan
 channel does not return to firmware control on this board, so full speed is also
 the state after the service ends. `--failsafe` sets full speed and exits; the unit
@@ -28,15 +29,24 @@ import signal
 import socket
 import sys
 import time
+from urllib.parse import quote, unquote
 
 SYSFS = os.environ.get("N5_FAN_SYSFS", "/sys")
 # Prometheus textfile output, off unless set (for example in /etc/default/n5-fan-control).
 PROM_DIR = os.environ.get("N5_FAN_PROM_DIR", "")
-# Internal NVMe drives seen so far, each with its temperature and limit files. Kept in the
-# unit's StateDirectory, so it survives service restarts and reboots: a drive or file that
-# drops out, or fails to appear at boot, means full speed. After removing or replacing a
-# drive on purpose, delete this file and restart the service.
+# Internal NVMe drives seen so far, by serial number, each with its temperature and limit
+# files. Kept in the unit's StateDirectory, so it survives service restarts and reboots: a
+# drive or file that drops out, or fails to appear at boot, means full speed until it has
+# been gone for REMAP_AFTER seconds (see remap). Kernel names (nvme0, nvme1) can change at
+# every boot, so they identify nothing here.
 SEEN_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "/var/lib/n5-fan-control"), "nvme-drives")
+# The record's first line. Versions before serials wrote one line per kernel name, with no
+# such line; such a record is replaced like a missing drive (see remap).
+SEEN_HEADER = "# n5-fan-control nvme-drives v2: drive serial (URL-encoded), then its files"
+# A drive that stops responding because it overheated should be back after this long at full
+# speed. One still missing was removed, moved or replaced, so the drives present are recorded
+# instead and the fans follow them again.
+REMAP_AFTER = 300
 DRIVER = "minisforum_n5_it5571"
 INTERVAL = 2.0
 MAX_STEP_DOWN = 4      # percent per interval; speeds rise at once and fall slowly
@@ -125,11 +135,12 @@ def usb4_attached(nvme_dir):
 
 
 def nvme_files():
-    """Every internal NVMe drive's hwmon directory and the temperature and limit files in it,
-    {drive: (dir, {file})}, without reading any. Drives attached through USB4 are left out, so
-    they are neither recorded nor used for the SSD fan (they sit outside the case and come and
-    go). Raises if a drive has no hwmon directory or there is no internal drive."""
-    found = {}
+    """Every internal NVMe drive's hwmon directory, the temperature and limit files in it
+    (without reading any) and its serial number, {drive: (dir, {file}, serial)}. Drives
+    attached through USB4 are left out, so they are neither recorded nor used for the SSD fan
+    (they sit outside the case and come and go). Raises if a drive has no hwmon directory, a
+    serial is blank or shared by two drives, or there is no internal drive."""
+    found, owner = {}, {}
     for d in sorted(glob.glob(os.path.join(SYSFS, "class/nvme/nvme*"))):
         if usb4_attached(d):
             continue
@@ -137,9 +148,16 @@ def nvme_files():
         hw = sorted(glob.glob(os.path.join(d, "hwmon*")) + glob.glob(os.path.join(d, "device/hwmon/hwmon*")))
         if not hw:
             raise RuntimeError(f"{name} has no temperature sensor")
+        with open(os.path.join(d, "serial")) as f:
+            serial = f.read().strip()        # the kernel pads it with spaces to 20 characters
+        if not serial:
+            raise RuntimeError(f"{name} reports no serial number")
+        if serial in owner:
+            raise RuntimeError(f"{owner[serial]} and {name} report the same serial number")
+        owner[serial] = name
         files = {os.path.basename(p) for p in glob.glob(os.path.join(hw[0], "temp*_input"))}
         files |= {f for f in ("temp1_max", "temp1_crit") if os.path.exists(os.path.join(hw[0], f))}
-        found[name] = (hw[0], files)
+        found[name] = (hw[0], files, serial)
     if not found:
         raise RuntimeError("no internal NVMe temperatures found")
     return found
@@ -151,7 +169,7 @@ def nvme_sensors(found):
     the warning temperature: temp1_max, capped at temp1_crit when the drive reports one, or
     DEFAULT_WARNING when it reports no temp1_max. Raises if a listed file cannot be read."""
     drives = {}
-    for name, (hw, files) in found.items():
+    for name, (hw, files, _) in found.items():
         temps = {"temp1": read_int(os.path.join(hw, "temp1_input")) / 1000}
         temps.update({f[:-len("_input")]: read_int(os.path.join(hw, f)) / 1000
                       for f in files if f.endswith("_input") and f != "temp1_input"})
@@ -169,21 +187,51 @@ def cpu_temp():
 
 
 def read_seen():
-    """NVMe drives recorded so far with their files, {drive: {file}}; empty on the first start
-    after installation. A line is the drive name and its files; a name alone (written by
-    versions before the file list) records the drive with no files yet."""
+    """NVMe drives recorded so far with their files, as (record, unusable). record is
+    {serial: {file}}, empty on the first start after installation. unusable is None, or why
+    the file cannot be used: a record by kernel name from a version before serials (no format
+    line), or an unknown format line. remap replaces an unusable record."""
     try:
         with open(SEEN_FILE) as f:
-            return {line.split()[0]: set(line.split()[1:]) for line in f if line.strip()}
+            lines = [line.split() for line in f if line.strip()]
     except FileNotFoundError:
-        return {}
+        return {}, None
+    if not lines:
+        return {}, None
+    if not lines[0][0].startswith("#"):
+        return {}, "a record by kernel name from an earlier version"
+    if " ".join(lines[0]) != SEEN_HEADER:
+        return {}, f"in an unknown format ({' '.join(lines[0])})"
+    return {unquote(line[0]): set(line[1:]) for line in lines[1:]}, None
 
 
 def write_seen(record):
     tmp = SEEN_FILE + ".tmp"
     with open(tmp, "w") as f:
-        f.write("".join(" ".join([n, *sorted(record[n])]) + "\n" for n in sorted(record)))
+        f.write(SEEN_HEADER + "\n" + "".join(" ".join([quote(s, safe=""), *sorted(record[s])]) + "\n"
+                                             for s in sorted(record)))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, SEEN_FILE)
+    d = os.open(os.path.dirname(SEEN_FILE), os.O_RDONLY)   # the rename survives a power cut only once
+    try:                                                   # the directory is on disk too
+        os.fsync(d)
+    finally:
+        os.close(d)
+
+
+def remap(fans, problem, present, now):
+    """Full speed while recorded drives or files are missing, or the record is unusable. Once
+    the same problem has lasted REMAP_AFTER seconds, record the drives present instead (by
+    serial, with their files) and return; until then, and while that write fails, raise."""
+    if fans.problem != problem:
+        fans.problem, fans.problem_since = problem, now
+    left = REMAP_AFTER - (now - fans.problem_since)
+    if left > 0:
+        raise RuntimeError(f"{problem}; the drives present are recorded instead in {left:.0f} s unless that changes")
+    write_seen(present)
+    log(f"{problem} for {REMAP_AFTER} s: recorded the internal drives present instead ({len(present)})")
+    fans.seen, fans.unusable, fans.problem = dict(present), None, None
 
 
 def plausible(t):
@@ -271,7 +319,10 @@ class Fans:
                 path = os.path.join(self.hw, node)
                 if not os.access(path, os.W_OK):
                     raise RuntimeError(f"{path} is not writable (driver needs experimental_write=1 and writable_mask)")
-        self.seen = read_seen()
+        self.seen = None     # {serial: {file}}, read at the first tick (see read_seen)
+        self.unusable = None # why the record file cannot be used, until remap replaces it
+        self.problem = None  # the missing drives or files (or unusable record) remap is timing
+        self.problem_since = None
         self.history = {}    # (drive, sensor): recent (time, C) readings, cleared after a fault
         self.duty = {name: None for name in FANS}
         self.running = {name: "off_below" not in spec for name, spec in FANS.items()}
@@ -367,15 +418,26 @@ def tick(fans, now=None):
     """One control step. Returns the targets used; any sensor problem means full speed."""
     now = time.monotonic() if now is None else now
     try:
+        tracked, fans.problem = fans.problem, None   # a tick that cannot see the problem restarts its wait
         found = nvme_files()
-        missing = [d for d in sorted(fans.seen) if d not in found]
-        missing += [f"{d} {f}" for d, (_, files) in sorted(found.items()) for f in sorted(fans.seen.get(d, set()) - files)]
-        candidate = {**fans.seen, **{d: fans.seen.get(d, set()) | files for d, (_, files) in found.items()}}
-        if candidate != fans.seen:
-            write_seen(candidate)            # record first, even beside a fault; memory follows only on success
-            fans.seen = candidate
-        if missing:
-            raise RuntimeError(f"{', '.join(missing)} recorded but no longer present on an internal drive")
+        present = {serial: files for _, files, serial in found.values()}
+        name = {serial: n for n, (_, _, serial) in found.items()}
+        if fans.seen is None:
+            fans.seen, fans.unusable = read_seen()
+        if fans.unusable:
+            problem = f"{SEEN_FILE} is {fans.unusable}"
+        else:
+            missing = [f"drive {s}" for s in sorted(fans.seen) if s not in present]
+            missing += [f"{name[s]} {f}" for s, files in sorted(present.items())
+                        for f in sorted(fans.seen.get(s, set()) - files)]
+            candidate = {**fans.seen, **{s: fans.seen.get(s, set()) | files for s, files in present.items()}}
+            if candidate != fans.seen:
+                write_seen(candidate)        # record first, even beside a fault; memory follows only on success
+                fans.seen = candidate
+            problem = missing and f"{', '.join(missing)} recorded but no longer present on an internal drive"
+        if problem:
+            fans.problem = tracked
+            remap(fans, problem, present, now)
         drives = nvme_sensors(found)
         cpu = cpu_temp()
         bad = [f"{d} {s}" for d, info in drives.items() for s, t in sorted(info["temps"].items()) if not plausible(t)]

@@ -23,9 +23,11 @@ DEFAULT_PROM_DIR = fanctl.PROM_DIR   # before make_sysfs overrides it
 DEFAULT_SEEN_FILE = fanctl.SEEN_FILE
 
 
-def make_sysfs(nvme=(40, 42), cpu=45, warning=None):
+def make_sysfs(nvme=(40, 42), cpu=45, warning=None, serials=None):
     """Each nvme entry is a composite temperature, or a tuple of the composite and its sensors.
-    warning: one temp1_max for every drive, a tuple of them per drive, or None for none."""
+    warning: one temp1_max for every drive, a tuple of them per drive, or None for none.
+    serials: each drive's serial number, by default SN0, SN1 and so on; padded with spaces to
+    20 characters as the kernel shows them."""
     root = Path(tempfile.mkdtemp())
     k10 = root / "class/hwmon/hwmon0"
     k10.mkdir(parents=True)
@@ -41,6 +43,7 @@ def make_sysfs(nvme=(40, 42), cpu=45, warning=None):
     for i, t in enumerate(nvme):
         hw = root / f"class/nvme/nvme{i}/hwmon{10 + i}"
         hw.mkdir(parents=True)
+        (hw.parent / "serial").write_text(f"{serials[i] if serials else f'SN{i}':<20}\n")
         for k, temp in enumerate(t if isinstance(t, tuple) else (t,), 1):
             (hw / f"temp{k}_input").write_text(f"{round(temp * 1000)}\n")
         w = warning[i] if isinstance(warning, tuple) else warning
@@ -54,7 +57,7 @@ def make_sysfs(nvme=(40, 42), cpu=45, warning=None):
     return root, ec
 
 
-def add_nvme(root, name, temp, port, supplier_driver=None, sensor=True):
+def add_nvme(root, name, temp, port, supplier_driver=None, sensor=True, serial=None):
     """A controller laid out as in real sysfs, below PCI root port `port`. With supplier_driver,
     the port gets a device-link supplier bound to that driver: the kernel links each USB4 PCIe
     tunnel port to its USB4 host interface, which the "thunderbolt" driver binds.
@@ -64,6 +67,7 @@ def add_nvme(root, name, temp, port, supplier_driver=None, sensor=True):
     ctl = pci / "nvme" / name
     ctl.mkdir(parents=True)
     (ctl / "device").symlink_to("../..")
+    (ctl / "serial").write_text(f"{serial or 'SN-' + name:<20}\n")
     if sensor:
         (ctl / "hwmon20").mkdir()
         (ctl / "hwmon20/temp1_input").write_text(f"{temp * 1000}\n")
@@ -92,6 +96,37 @@ def unplug(root, name, pci):
 
 def pwm(ec, ch):
     return int((ec / f"pwm{ch}").read_text())
+
+
+def full(ec):
+    return pwm(ec, 1) == 255 and pwm(ec, 2) == 255 and pwm(ec, 4) == 255
+
+
+def record(*lines):
+    """The record file's expected text: its format line, then one line per drive."""
+    return fanctl.SEEN_HEADER + "\n" + "".join(line + "\n" for line in lines)
+
+
+def reboot(**sysfs):
+    """A new fake sysfs (make_sysfs arguments) that keeps the record file, and a started service."""
+    seen = Path(fanctl.SEEN_FILE)
+    root, ec = make_sysfs(**sysfs)
+    if seen.exists():
+        shutil.copy(seen, fanctl.SEEN_FILE)
+    fans = fanctl.Fans()
+    fans.take_over()
+    return root, ec, fans
+
+
+def logged(fn):
+    """Run fn and return what the service logged meanwhile."""
+    lines, real = [], fanctl.log
+    fanctl.log = lines.append
+    try:
+        fn()
+    finally:
+        fanctl.log = real
+    return lines
 
 
 def ssd_pwm(margin):
@@ -279,6 +314,8 @@ def test_files_listed_beside_a_missing_input_are_still_recorded():
         for i in range(2, 5):
             fanctl.tick(fans, now=2.0 * i)
             assert pwm(ec, 1) == 255 and pwm(ec, 2) == 255 and pwm(ec, 4) == 255, (case, i)
+        fanctl.tick(fanctl.Fans(), now=10)                                # and after a restart
+        assert full(ec), (case, "restart")
 
 
 def test_recorded_files_survive_a_restart_and_old_records_upgrade():
@@ -286,7 +323,7 @@ def test_recorded_files_survive_a_restart_and_old_records_upgrade():
     hw0 = root / "class/nvme/nvme0/hwmon10"
     fanctl.tick(fanctl.Fans(), now=0)
     assert Path(fanctl.SEEN_FILE).read_text() == \
-        "nvme0 temp1_input temp1_max temp2_input temp3_input\nnvme1 temp1_input temp1_max\n"
+        record("SN0 temp1_input temp1_max temp2_input temp3_input", "SN1 temp1_input temp1_max")
     for vanish in ("temp1_max", "temp3_input"):
         (hw0 / vanish).rename(hw0 / f"{vanish}.away")
         fans = fanctl.Fans()                                           # a service restart or a reboot
@@ -295,10 +332,262 @@ def test_recorded_files_survive_a_restart_and_old_records_upgrade():
         assert pwm(ec, 2) == 255, f"{vanish} recorded before the restart and missing now"
         (hw0 / f"{vanish}.away").rename(hw0 / vanish)
     Path(fanctl.SEEN_FILE).write_text("nvme0\nnvme1\n")                 # written by a version before file lists
-    fanctl.tick(fanctl.Fans(), now=4)
-    assert pwm(ec, 2) == ssd_pwm(82 - 55), "an old record is not a fault"
+    fans = fanctl.Fans()
+    fanctl.tick(fans, now=4)
+    assert pwm(ec, 2) == 255, "a record by kernel name cannot tell the drives apart"
+    fanctl.tick(fans, now=4 + fanctl.REMAP_AFTER)
+    assert pwm(ec, 2) < 255
     assert Path(fanctl.SEEN_FILE).read_text() == \
-        "nvme0 temp1_input temp1_max temp2_input temp3_input\nnvme1 temp1_input temp1_max\n"
+        record("SN0 temp1_input temp1_max temp2_input temp3_input", "SN1 temp1_input temp1_max")
+
+
+def test_drives_renamed_at_boot_keep_the_curve():
+    # 11 October 2026 on N5: a reboot gave the drives new kernel names, and a record by name held
+    # the fans at full speed. The record follows each drive by its serial number instead.
+    _, ec = make_sysfs(nvme=((50, 55, 52), (45,), (48, 51, 49)), warning=82, serials=("A", "B", "C"))
+    fanctl.tick(fanctl.Fans(), now=0)
+    assert pwm(ec, 2) == ssd_pwm(82 - 55)
+    _, ec, fans = reboot(nvme=((45,), (48, 51, 49), (50, 55, 52)), warning=82, serials=("B", "C", "A"))
+    for i in range(3):
+        fanctl.tick(fans, now=2.0 * i)
+        assert pwm(ec, 2) == ssd_pwm(82 - 55), i
+
+
+def test_internal_name_taken_by_a_usb4_drive_after_a_reboot_keeps_the_curve():
+    root, ec = make_sysfs(nvme=(50, 45), serials=("A", "B"))
+    add_nvme(root, "nvme2", 48, "0000:00:01.4", serial="C")
+    fanctl.tick(fanctl.Fans())
+    root, ec, fans = reboot(nvme=(45,), serials=("B",))
+    add_nvme(root, "nvme1", 41, "0000:00:04.1", "thunderbolt", serial="U")
+    add_nvme(root, "nvme2", 50, "0000:00:01.4", serial="A")
+    add_nvme(root, "nvme3", 48, "0000:00:01.5", serial="C")
+    for _ in range(3):
+        fanctl.tick(fans)
+        assert pwm(ec, 2) == ssd_pwm(fanctl.DEFAULT_WARNING - 50) and pwm(ec, 1) != 255
+
+
+def test_drive_replaced_under_the_same_name_means_full_speed():
+    make_sysfs(nvme=(40, 42), serials=("A", "B"))
+    fanctl.tick(fanctl.Fans())
+    _, ec, fans = reboot(nvme=(40, 42), serials=("A", "D"))
+    for _ in range(3):
+        fanctl.tick(fans)
+        assert full(ec), "drive B is gone, though a drive named nvme1 is present"
+
+
+def test_recorded_file_missing_on_a_renamed_drive_means_full_speed():
+    make_sysfs(nvme=((50, 55, 52), (45,)), warning=82, serials=("A", "B"))
+    fanctl.tick(fanctl.Fans())
+    _, ec, fans = reboot(nvme=((45, 47, 46), (50, 55)), warning=82, serials=("B", "A"))   # A lost temp3
+    for _ in range(3):
+        fanctl.tick(fans)
+        assert full(ec)
+
+
+def test_serial_problems_mean_full_speed():
+    for case in ("blank", "duplicate", "unreadable"):
+        root, ec = make_sysfs(nvme=(40, 42))
+        fans = fanctl.Fans()
+        fanctl.tick(fans)
+        assert pwm(ec, 2) < 255
+        serial = root / "class/nvme/nvme1/serial"
+        if case == "blank":
+            serial.write_text(" " * 20 + "\n")
+        elif case == "duplicate":
+            serial.write_text("SN0\n")
+        else:
+            serial.unlink()
+        for _ in range(3):
+            fanctl.tick(fans)
+            assert full(ec), case
+    for serials in (("SN0", "SN0"), ("SN0", "")):                       # from the first start
+        _, ec = make_sysfs(nvme=(40, 42), serials=serials)
+        fanctl.tick(fanctl.Fans())
+        assert full(ec), serials
+        assert not Path(fanctl.SEEN_FILE).exists(), "drives that cannot be told apart are not recorded"
+
+
+def test_serials_with_spaces_or_percent_signs_are_recorded_safely():
+    serials = ("AB 12", "X%2041")
+    _, ec = make_sysfs(nvme=(40, 42), serials=serials)
+    fanctl.tick(fanctl.Fans())
+    assert Path(fanctl.SEEN_FILE).read_text() == record("AB%2012 temp1_input", "X%252041 temp1_input")
+    _, ec, fans = reboot(nvme=(42, 40), serials=serials[::-1])
+    fanctl.tick(fans)
+    assert pwm(ec, 2) == ssd_pwm(fanctl.DEFAULT_WARNING - 42)
+
+
+def name_keyed(*drives):
+    """The text of a record by kernel name, as versions before serials wrote it."""
+    return "".join(" ".join(d) + "\n" for d in drives)
+
+
+ALL_SENSORS = ("temp1_crit", "temp1_input", "temp1_max", "temp2_input", "temp3_input")
+
+
+def make_n5(order):
+    """Five internal drives as on N5 on 12 October 2026: four with three sensors, and the boot
+    drive (serial W) with only the composite. order: the serials in kernel name order."""
+    temps = {"A": (50, 55, 52), "B": (48, 51, 49), "C": (47, 50, 49), "E": (46, 49, 48), "W": (45,)}
+    root, ec = make_sysfs(nvme=tuple(temps[s] for s in order), warning=82, serials=order)
+    for hw in root.glob("class/nvme/nvme*/hwmon*"):
+        (hw / "temp1_crit").write_text("85000\n")
+    return root, ec
+
+
+def test_name_keyed_record_is_replaced_after_remap_after():
+    # The record on N5 on 12 October 2026, by kernel name, read on a boot that names the drives
+    # differently. It cannot say which drive is which, so it is treated like a missing drive.
+    old = name_keyed(("nvme0", "temp1_crit", "temp1_input", "temp1_max"),
+                     *((f"nvme{i}",) + ALL_SENSORS for i in (1, 2, 3, 5)))
+    _, ec = make_n5(order=("A", "B", "C", "W", "E"))
+    Path(fanctl.SEEN_FILE).write_text(old)
+    fans = fanctl.Fans()
+    for t in (0, 100, fanctl.REMAP_AFTER - 1):
+        lines = logged(lambda: fanctl.tick(fans, now=t))
+        assert full(ec), t
+        assert any("by kernel name" in line for line in lines), lines
+        assert Path(fanctl.SEEN_FILE).read_text() == old, t
+    lines = logged(lambda: fanctl.tick(fans, now=fanctl.REMAP_AFTER))
+    assert pwm(ec, 2) < 255, lines
+    assert Path(fanctl.SEEN_FILE).read_text() == record(
+        *(" ".join((s,) + ALL_SENSORS) for s in ("A", "B", "C", "E")), "W temp1_crit temp1_input temp1_max")
+    assert sum("recorded the internal drives present instead (5)" in line for line in lines) == 1, lines
+    fans = fanctl.Fans()                                               # the next restart
+    lines = logged(lambda: fanctl.tick(fans, now=0))
+    assert not any("by kernel name" in line for line in lines), lines
+    assert pwm(ec, 2) == ssd_pwm(82 - 55)
+
+
+def test_unknown_record_format_is_replaced_after_remap_after():
+    _, ec = make_sysfs()
+    text = "# n5-fan-control nvme-drives v3\nSN0 temp1_input\n"
+    Path(fanctl.SEEN_FILE).write_text(text)
+    fans = fanctl.Fans()
+    for t in (0, fanctl.REMAP_AFTER - 1):
+        fanctl.tick(fans, now=t)
+        assert full(ec), t
+        assert Path(fanctl.SEEN_FILE).read_text() == text
+    fanctl.tick(fans, now=fanctl.REMAP_AFTER)
+    assert pwm(ec, 2) < 255
+    assert Path(fanctl.SEEN_FILE).read_text() == record("SN0 temp1_input", "SN1 temp1_input")
+
+
+def test_missing_drive_is_replaced_after_remap_after():
+    # An overheated drive that stopped responding should be back within REMAP_AFTER at full speed;
+    # one still missing was removed or moved, and full speed must not last forever.
+    make_sysfs(nvme=(40, 42), serials=("A", "B"))
+    fanctl.tick(fanctl.Fans())
+    _, ec, fans = reboot(nvme=(40,), serials=("A",))
+    for t in (0, 100, fanctl.REMAP_AFTER - 1):
+        fanctl.tick(fans, now=t)
+        assert full(ec), t
+    lines = logged(lambda: fanctl.tick(fans, now=fanctl.REMAP_AFTER))
+    assert any(line.startswith("drive B recorded but no longer present") and "instead (1)" in line
+               for line in lines), lines
+    assert Path(fanctl.SEEN_FILE).read_text() == record("A temp1_input")
+    assert pwm(ec, 2) < 255
+    fanctl.tick(fanctl.Fans(), now=0)                                  # and after a restart
+    assert pwm(ec, 2) == ssd_pwm(fanctl.DEFAULT_WARNING - 40)
+
+
+def test_drive_back_before_remap_after_keeps_the_record():
+    root, ec = make_sysfs(nvme=(40, 42))
+    fans = fanctl.Fans()
+    fanctl.tick(fans, now=0)
+    nvme1, away = root / "class/nvme/nvme1", root / "nvme1.away"
+    nvme1.rename(away)
+    fanctl.tick(fans, now=2)
+    assert full(ec)
+    away.rename(nvme1)
+    assert fanctl.tick(fans, now=200) is not None, "back in time: the record stands"
+    nvme1.rename(away)
+    for t in (250, 250 + fanctl.REMAP_AFTER - 1):
+        fanctl.tick(fans, now=t)
+        assert full(ec), "the wait starts again"
+    assert Path(fanctl.SEEN_FILE).read_text() == record("SN0 temp1_input", "SN1 temp1_input")
+    fanctl.tick(fans, now=250 + fanctl.REMAP_AFTER)
+    assert pwm(ec, 2) < 255
+    assert Path(fanctl.SEEN_FILE).read_text() == record("SN0 temp1_input")
+
+
+def test_another_drive_missing_restarts_the_wait():
+    root, ec = make_sysfs(nvme=(40, 42, 44))
+    fans = fanctl.Fans()
+    fanctl.tick(fans, now=0)
+    shutil.rmtree(root / "class/nvme/nvme2")
+    fanctl.tick(fans, now=2)
+    shutil.rmtree(root / "class/nvme/nvme1")
+    fanctl.tick(fans, now=200)
+    fanctl.tick(fans, now=2 + fanctl.REMAP_AFTER)
+    assert full(ec), "the wait counts from the latest change in what is missing"
+    fanctl.tick(fans, now=200 + fanctl.REMAP_AFTER)
+    assert pwm(ec, 2) < 255
+    assert Path(fanctl.SEEN_FILE).read_text() == record("SN0 temp1_input")
+
+
+def test_a_tick_that_cannot_list_the_drives_restarts_the_wait():
+    root, ec = make_sysfs(nvme=(40, 42))
+    fans = fanctl.Fans()
+    fanctl.tick(fans, now=0)
+    nvme1, away = root / "class/nvme/nvme1", root / "nvme1.away"
+    serial0 = root / "class/nvme/nvme0/serial"
+    nvme1.rename(away)
+    fanctl.tick(fans, now=2)                                             # nvme1 missing
+    away.rename(nvme1)
+    serial0.write_text(" " * 20 + "\n")                                  # back, beside an unrelated fault
+    fanctl.tick(fans, now=100)
+    nvme1.rename(away)
+    serial0.write_text("SN0\n")
+    for t in (2 + fanctl.REMAP_AFTER, 100 + fanctl.REMAP_AFTER):
+        fanctl.tick(fans, now=t)
+        assert full(ec), "missing again since the fault: a full wait"
+    assert Path(fanctl.SEEN_FILE).read_text() == record("SN0 temp1_input", "SN1 temp1_input")
+
+
+def test_missing_file_on_a_present_drive_is_replaced_after_remap_after():
+    root, ec = make_sysfs(nvme=((50, 55, 52),), warning=82)
+    fans = fanctl.Fans()
+    fanctl.tick(fans, now=0)
+    (root / "class/nvme/nvme0/hwmon10/temp3_input").unlink()
+    for t in (2, 1 + fanctl.REMAP_AFTER):
+        fanctl.tick(fans, now=t)
+        assert full(ec), t
+    fanctl.tick(fans, now=2 + fanctl.REMAP_AFTER)
+    assert pwm(ec, 2) < 255
+    assert Path(fanctl.SEEN_FILE).read_text() == record("SN0 temp1_input temp1_max temp2_input")
+
+
+def test_failed_remap_write_stays_full():
+    root, ec = make_sysfs(nvme=(40, 42))
+    fans = fanctl.Fans()
+    fanctl.tick(fans, now=0)
+    shutil.rmtree(root / "class/nvme/nvme1")
+    fanctl.tick(fans, now=2)
+    fanctl.SEEN_FILE = str(root / "state" / "nvme-drives")            # writes now fail
+    for t in (2 + fanctl.REMAP_AFTER, 4 + fanctl.REMAP_AFTER):
+        assert fanctl.tick(fans, now=t) is None
+        assert full(ec), t
+    (root / "state").mkdir()
+    assert fanctl.tick(fans, now=6 + fanctl.REMAP_AFTER) is not None
+    assert Path(fanctl.SEEN_FILE).read_text() == record("SN0 temp1_input")
+
+
+def test_record_write_syncs_the_file_then_the_directory():
+    root, _ = make_sysfs()
+    events, real_fsync, real_replace = [], os.fsync, os.replace
+    def fsync(fd):
+        events.append(("fsync", os.fstat(fd).st_ino))
+        real_fsync(fd)
+    def replace(src, dst):
+        events.append(("replace",))
+        real_replace(src, dst)
+    fanctl.os.fsync, fanctl.os.replace = fsync, replace
+    try:
+        fanctl.write_seen({"SN0": {"temp1_input"}})
+    finally:
+        fanctl.os.fsync, fanctl.os.replace = real_fsync, real_replace
+    assert events == [("fsync", os.stat(fanctl.SEEN_FILE).st_ino), ("replace",), ("fsync", os.stat(root).st_ino)]
 
 
 def test_trend_does_not_span_a_fault():
@@ -385,7 +674,7 @@ def test_failed_seen_write_is_retried_and_stays_full():
     assert fans.seen == {}, "memory must not run ahead of the file"
     (root / "state").mkdir()
     fanctl.tick(fans)
-    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0 temp1_input\nnvme1 temp1_input\n"
+    assert Path(fanctl.SEEN_FILE).read_text() == record("SN0 temp1_input", "SN1 temp1_input")
     assert pwm(ec, 2) < 255
 
 
@@ -407,9 +696,10 @@ def test_drive_appearing_later_is_added():
     hw = root / "class/nvme/nvme1/hwmon11"
     hw.mkdir(parents=True)
     (hw / "temp1_input").write_text("41000\n")
+    (hw.parent / "serial").write_text("SN1\n")
     fanctl.tick(fans)
     assert pwm(ec, 2) < 255, "a new drive is not a fault"
-    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0 temp1_input\nnvme1 temp1_input\n"
+    assert Path(fanctl.SEEN_FILE).read_text() == record("SN0 temp1_input", "SN1 temp1_input")
 
 
 def test_usb4_drive_appearing_and_disappearing_keeps_the_curve():
@@ -423,7 +713,7 @@ def test_usb4_drive_appearing_and_disappearing_keeps_the_curve():
     (pci / "nvme/nvme5/hwmon20").mkdir()
     (pci / "nvme/nvme5/hwmon20/temp1_input").write_text("41000\n")
     fanctl.tick(fans)
-    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0 temp1_input\nnvme1 temp1_input\n", "a USB4 drive is not recorded"
+    assert Path(fanctl.SEEN_FILE).read_text() == record("SN0 temp1_input", "SN1 temp1_input"), "a USB4 drive is not recorded"
     unplug(root, "nvme5", pci)
     pci = add_nvme(root, "nvme6", 41, "0000:00:04.1", "thunderbolt")    # replugged under a new name
     fanctl.tick(fans)
@@ -431,7 +721,7 @@ def test_usb4_drive_appearing_and_disappearing_keeps_the_curve():
     for _ in range(3):
         fanctl.tick(fans)
     assert pwm(ec, 2) == curve_42 and pwm(ec, 1) != 255, "unplugging a USB4 drive is not a fault"
-    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0 temp1_input\nnvme1 temp1_input\n"
+    assert Path(fanctl.SEEN_FILE).read_text() == record("SN0 temp1_input", "SN1 temp1_input")
 
 
 def test_internal_drive_disappearing_beside_a_usb4_drive_means_full_speed():
@@ -440,7 +730,7 @@ def test_internal_drive_disappearing_beside_a_usb4_drive_means_full_speed():
     add_nvme(root, "nvme2", 41, "0000:00:04.1", "thunderbolt")
     fans = fanctl.Fans()
     fanctl.tick(fans)
-    assert Path(fanctl.SEEN_FILE).read_text() == "nvme0 temp1_input\nnvme1 temp1_input\n"
+    assert Path(fanctl.SEEN_FILE).read_text() == record("SN-nvme1 temp1_input", "SN0 temp1_input")
     assert pwm(ec, 2) < 255
     unplug(root, "nvme1", internal)
     fanctl.tick(fans)

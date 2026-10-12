@@ -66,12 +66,14 @@ All three controlled channels go to full speed when:
 
 - a temperature is missing, unreadable, or outside 5 to 120°C, including any internal sensor of an NVMe drive;
 - a drive's `temp1_max` or `temp1_crit` exists but cannot be read or is outside 50 to 100°C;
-- an internal NVMe drive has no temperature sensor, or an internal drive the service has seen before is missing, or one of its temperature or limit files (`temp*_input`, `temp1_max`, `temp1_crit`) is, including after a restart or a reboot. The list of drives and their files is kept in `/var/lib/n5-fan-control/nvme-drives`, one line per drive; full speed also holds while that list cannot be written. A file counts once a complete listing of the drives has seen it, so a drive that first appears without `temp1_max` gets the 70°C default;
+- an internal NVMe drive has no temperature sensor, or an internal drive the service has seen before is missing, or one of its temperature or limit files (`temp*_input`, `temp1_max`, `temp1_crit`) is, including after a restart or a reboot. The list of drives and their files is kept in `/var/lib/n5-fan-control/nvme-drives`, one line per drive, by serial number: the kernel can give the drives different names (`nvme0`, `nvme1`) at every boot, so a new name is not a missing drive. Full speed also holds while that list cannot be written, and while an internal drive reports no serial number or the same one as another drive. A file counts once a complete listing of the drives has seen it, so a drive that first appears without `temp1_max` gets the 70°C default. A missing drive or file holds full speed for 5 minutes (see below);
 - the service stops, crashes, or stops responding for 20 seconds (systemd watchdog; `ExecStopPost` runs `n5-fan-control --failsafe`).
 
 The service also refuses to start unless its three channels are writable. After a sensor problem clears, speeds fall from full at the normal 4% per update, and trends start again from new readings. Optional parts do not affect fan control: an unreadable SSD fan speed is left out of the metrics, and a failed metrics write is logged.
 
-After removing or replacing an NVMe drive on purpose, clear the list, or the fans stay at full speed (a replacement with fewer sensors also counts as a missing file). A list written by a version before the file lists names drives only; the service adds their files on its first update.
+A drive that overheats can stop responding and come back once it has cooled, so a missing drive or file first holds the fans at full speed. If the same drives and files are still missing after 5 minutes, the service treats it as a change of hardware (a drive removed, moved to a USB4 enclosure, or replaced; a replacement has a new serial number) rather than an overheated drive. It records the internal drives present instead, logs which drives or files it dropped, and the fans follow the drives present again. Any further change in what is missing starts the 5 minutes again. A list that cannot tell the drives apart, such as the list by kernel name that earlier versions kept, is replaced the same way after 5 minutes at full speed.
+
+To skip the 5 minutes after changing drives on purpose, clear the list:
 
 ```bash
 sudo rm /var/lib/n5-fan-control/nvme-drives
